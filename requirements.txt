@@ -1,0 +1,11 @@
+# Tested on Python 3.11-3.13.
+geopandas>=1.0
+shapely>=2.0          # 2.x is required: the code uses the vectorised API
+                      # (STRtree.query on arrays, shapely.intersection, prepare)
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10           # cKDTree, for the 3-mile neighbourhood
+matplotlib>=3.7
+pyogrio>=0.7          # strongly recommended: pushes row filters and bounding
+                      # boxes down to GDAL, which is what makes reading a
+                      # national CSB file tractable. fiona works but is slow.
