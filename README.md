@@ -68,7 +68,7 @@ Both scripts are written in jupytext percent format (`# %%`), so they open as no
 
 ```
 PROJECT_DIR/
-  raw_data/                      <- YOU put the downloads here. Never created.
+  raw_data/                      <- User adds data here.
   clipped_layers/                <- created: the cache
     <st>_state_layers.gpkg           every layer, clipped to the state
     <st>_state_layers.cache.json     what each layer was built from
@@ -177,7 +177,7 @@ Everything below is in the same unit: **riparian-cropland acres per square mile.
 threshold_applied(i) = max( HOT_MULTIPLE × R(i) , FLOOR )
 ```
 
-R varies by county; FLOOR does not. Whatever this one number is reported as `threshold_applied` and is written to the manifest for every county — so the number each county actually had to clear is on the record, in absolute acres per square mile, and two runs can always be compared on that column.
+R varies by county; FLOOR does not. Whatever this one number is reported as `threshold_applied` and is written to the manifest for every county — so the number each county actually had to clear is on the record, in absolute acres per square mile, and two runs can be compared on that column.
 
 | Code switch option | computed over | Example of a two-county run… |
 |---|---|---|
@@ -211,7 +211,7 @@ Nothing else. The state's name, postal code, county word, cache file name, downl
 | set | to |
 |---|---|
 | `raw_data/` | the new PA file (`*_PA_*.shp` or any `*priority*area*`) |
-| `COUNTY_EXTENT_MODE` (§3) | leave `'whole_county'` — the right answer in almost every case, and the one `REPORT_WITHIN_PA` requires. Only use `'pa_only'` for a cold start where you will never want the statewide surface. |
+| `COUNTY_EXTENT_MODE` (§3) | leave `'whole_county'` — the right answer in almost every case, and the one `REPORT_WITHIN_PA` requires. Only use `'pa_only'` for a cold start where you do not want the statewide surface. |
 | `REPORT_WITHIN_PA` (§3) | `True` to report inside the PA without rebuilding Pass A — the usual choice, with `COUNTY_EXTENT_MODE` left at `'whole_county'`. `False` leaves the PA as reporting columns only. |
 
 **Changes vs. Scenario 1.** Preprocessing cuts every resource layer to the state, never to the priority area, so a new PA costs one small `pa_geo` rebuild. CSB, NHD and NWI are untouched. `'auto'` notices the source file changed and rebuilds that one layer.
@@ -227,11 +227,11 @@ Two settings control your study area, and they answer **two different questions*
 |---|---|---|---|
 | You want the **statewide** product. The PA is context — you want to be able to say "of the top 20 counties, 14 are in our footprint". | `COUNTY_EXTENT_MODE = 'whole_county'`<br>`REPORT_WITHIN_PA = False` | One statewide build (hours) | Every county in the state gets a row. `pa_share` and `in_pa` say which are in the footprint. Full 3-mile measurement everywhere. |
 | You want results for the **PA only** (new or old PA), and you already have a statewide surface. | `COUNTY_EXTENT_MODE = 'whole_county'`<br>`REPORT_WITHIN_PA = True` | **NONE** (minutes) | Only PA ground is reported. Every average, the floor, the zones and all figures are computed on PA ground — but each cell keeps its **full 3-mile measurement**, so cells near the boundary are still measured honestly. `band_in_report` says, per cell, how much of its 3 miles came from inside the PA. Counties overlapping the PA by less than `MIN_PA_SHARE` are dropped rather than clipped to a sliver. |
-| You want PA results, you are starting a new state, and you will never want the statewide product. | `COUNTY_EXTENT_MODE = 'pa_only'`<br>`REPORT_WITHIN_PA = False` | Scales with the PA, not the state — often minutes. | A small, fast surface covering only the PA. **The trade-off:** cells near the PA boundary have their 3-mile radius truncated. Good for a first look but may need a larger surface run. |
+| You want PA results, you are starting a new state, and you do not want the statewide product. | `COUNTY_EXTENT_MODE = 'pa_only'`<br>`REPORT_WITHIN_PA = False` | Scales with the PA, not the state — often minutes. | A small, fast surface covering only the PA. **The trade-off:** cells near the PA boundary have their 3-mile radius truncated. Good for a first look but may need a larger surface run. |
 
 ##### How to run a new priority area if you have already run an old one
 
-Nothing is rebuilt, for either of the first two rows above. Preprocessing cuts every resource layer to the **state**, never to the PA, so CSB, NHD and NWI are untouched; and the surface signature identifies the cache by the layers Pass A actually opens, which does not include `pa_geo`. A new boundary therefore moves nothing the surface depends on. Three steps:
+Nothing is rebuilt, for either of the first two rows above. Preprocessing cuts every resource layer to the **state**, not to the PA, so CSB, NHD and NWI are untouched; and the surface signature identifies the cache by the layers Pass A actually opens, which does not include `pa_geo`. A new boundary therefore moves nothing the surface depends on. Three steps:
 
 1. Put the new PA file in `raw_data/` and **remove or rename the old one**. The pattern `*_PA_*.shp` will match both, and when more than one file matches, the newest wins — which is probably what you want, but the run prints which file it used and you should read that line rather than trust it.
 2. Run `fl_01_preprocess.py` with `RUN_PREPROCESS = 'auto'`. It rebuilds `pa_geo` and nothing else — the log says so in one line: `pa_geo  source has changed since it was cached - rebuilding`.
@@ -401,7 +401,7 @@ Raising the floor buys riparian concentration and costs area capture, and the kn
 - **concentration** = share of the riparian cropland designated ÷ share of the area designated. Higher is more targeted.
 - **capture** = the share of the state's riparian cropland that is still inside the map. Higher is more complete.
 
-Raising the floor increases the first and decreases the second, always.
+Raising the floor increases concentrations and decreases capture.
 
 Three of the four rules share one shape. Put gain and cost on a 0–1 scale over the swept range, and take the percentile that maximises the difference:
 
@@ -619,7 +619,7 @@ All inputs located in `fl_config.py`. Environment variables in the last column o
 | `FLOOR_KNEE_MARGINAL_SMOOTH` | `3` | `'marginal'` only: steps in the centred rolling median taken before the crossing is tested. `1` = raw |
 | `FLOOR_KNEE_PLATEAU_TOL` | `0.05` | how close to a rule's best its net must be for that floor to count as inside the rule's plateau, as a fraction of the rule's own net range |
 | `FLOOR_KNEE_GRID` | `2.5` | percentile step of the knee search (the reported table stays on `FLOOR_SWEEP_PCTLS`) |
-| `FLOOR_KNEE_MAX_PCTL` | `95.0` | never recommend a floor above this percentile |
+| `FLOOR_KNEE_MAX_PCTL` | `95.0` | don't recommend a floor above this percentile |
 | `FLOOR_KNEE_MIN_RANGE` | `0.05` | how far concentration must move across the sweep before a knee is considered real |
 | `REGION_MIN_COVER` / `REGION_MIN_CELLS` | `0.50` / `30` | when a HUC8 is too small or too poorly covered to be its own reference and falls back to the state |
 | `MIN_ZONE_COUNTY_AC` | `640.0` | a zone is whole 1-mile cells, so it laps over the county line; less than this next door is overhang, not a share. One whole cell, so a county cannot claim a zone it holds no hot cell of |
@@ -665,7 +665,7 @@ All inputs located in `fl_config.py`. Environment variables in the last column o
 | `SURFACE` / `INK` / `INK2` / `MUTED` / `NEUTRAL` / `ZONE_INK` | colours | the surface and the three inks |
 | `SERIF_STACK` | list | the serif stack, first available wins |
 | `FS` | dict | every type size in the run |
-| `RATIO_HEADROOM` | `2.67` | headroom on the ratio scale, so the threshold line always sits at the same height |
+| `RATIO_HEADROOM` | `2.67` | headroom on the ratio scale, so the threshold line sits at the same height |
 | `DRAW_SIMPLIFY_M` | `25.0` | simplification for drawing only — never for measuring |
 
 The cover maps have four knobs of their own. They are read through `globals().get`, so they work whether or not they are in the config — add them to §7 when they need arguing about:
