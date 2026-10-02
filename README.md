@@ -46,15 +46,15 @@ Once Pass A `state_surface.gpkg` is on disk, changing the reference basis, the f
 Five files are included in the original push. Everything you can change is in the first one.
 
 ```
-fl_config.py          EVERY switch, path, threshold and input pattern.
-                      The only file you should have to edit.
+fl_config.py          All switches, path, threshold and input pattern.
+                      Edit this file to configure a run.
 
 fl_common.py          shared machinery: imports, file-finding, the loader,
                       the geometry helpers, the cache manifest. Decides nothing.
 
-fl_01_preprocess.py   raw downloads  ->  one cached GeoPackage.   Run once.
+fl_01_preprocess.py   raw downloads  ->  one cached GeoPackage.
 
-fl_02_statewide.py    the cache      ->  the whole deliverable.   Re-runnable.
+fl_02_statewide.py    the cache      ->  concentration and parcel analyses
 
 fl_run_all.py         runs 01 then 02, stopping if 01 fails.
 
