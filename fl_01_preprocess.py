@@ -170,14 +170,15 @@ print(f'  state area   {STATE_AC:,.0f} ac ({STATE_AC / 640:,.0f} sq mi) '
 # when it is missing from the cache. Nothing else in preprocessing depends on
 # it: every resource layer is cut to the STATE, so a new priority area costs
 # one small re-read and nothing else.
+_PA_WHY = stale_reason('pa_geo', DATASETS['pa'])
 _PA_STALE = ('pa_geo' not in _have
              or RUN_PREPROCESS is True
-             or layer_is_stale('pa_geo', DATASETS['pa']))
+             or _PA_WHY is not None)
 pa_geo = (load_cached('pa_geo', required=False)
           if 'pa_geo' in _have and not _PA_STALE else None)
 if 'pa_geo' in _have and _PA_STALE:
-    print(f'  {"pa_geo":<12} source has changed since it was cached - '
-          f'rebuilding')
+    print(f'  {"pa_geo":<12} '
+          f'{_PA_WHY or "RUN_PREPROCESS = True"} - rebuilding')
 if pa_geo is None and DATASETS['pa'].get('path'):
     _pa = read_source('pa')
     if _pa is not None and len(_pa):
@@ -227,14 +228,28 @@ def build_layer(name, force=False):
     """Read one registered dataset, cut it to the state, cache it."""
     spec = DATASETS[name]
     if not force and name in cache_layers():
-        if layer_is_stale(name, spec, MANIFEST):
-            print(f'  {name:<12} SOURCE HAS CHANGED since this layer was '
-                  f'cached - rebuilding')
+        _why = stale_reason(name, spec, MANIFEST)
+        if _why:
+            print(f'  {name:<12} {_why} - rebuilding')
         else:
             g = load_cached(name, required=spec['required'])
-            if g is not None and len(g):
+            # A REGISTRY THAT NOW ASKS FOR MORE COLUMNS IS A STALE LAYER
+            # TOO, and layer_is_stale cannot see it: the SOURCE FILE has
+            # not changed, only which of its fields we want. Raising
+            # CROP_SEQ_YEARS from 1 to 3 would otherwise leave a
+            # one-year cache in place and silently give no sequence.
+            _short = []
+            _ns = newest_spec(spec)
+            if g is not None and _ns is not None:
+                _al, _pat, _n = _ns
+                if len(cdl_year_cols(g, _pat)) < _n:
+                    _short = [f'{_al} years']
+            if g is not None and len(g) and not _short:
                 return g
-            print(f'  {name:<12} cached copy is EMPTY - rebuilding')
+            print(f'  {name:<12} '
+                  + (f'cached copy is short of {", ".join(_short)} '
+                     f'the registry now asks for - rebuilding'
+                     if _short else 'cached copy is EMPTY - rebuilding'))
 
     g = read_source(name, bbox=AOI_BBOX)
     if g is None or not len(g):
@@ -494,5 +509,13 @@ print(f'  Next: python fl_02_statewide.py')
 if SCRATCH_DIR and os.path.abspath(CACHE).startswith(
         os.path.abspath(SCRATCH_DIR)):
     os.makedirs(FINAL_CLIPPED_DIR, exist_ok=True)
-    copy_to_final([(CACHE, os.path.join(FINAL_CLIPPED_DIR, CACHE_NAME),
-                    'cache')])
+    _final_cache = os.path.join(FINAL_CLIPPED_DIR, CACHE_NAME)
+    _jobs = [(CACHE, _final_cache, 'cache')]
+    # THE SIDECAR GOES WITH IT. Copying the GeoPackage alone is what
+    # made a restored cache rebuild all nine layers: the durable copy
+    # had no record of what built it. It is a few KB against ~900 MB.
+    if os.path.exists(CACHE_MANIFEST):
+        _jobs.append((CACHE_MANIFEST,
+                      os.path.splitext(_final_cache)[0] + '.cache.json',
+                      'cache manifest'))
+    copy_to_final(_jobs)

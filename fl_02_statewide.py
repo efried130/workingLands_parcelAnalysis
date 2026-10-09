@@ -579,7 +579,12 @@ else:
     import time as _t
     _t0 = _t.time()
 
-    _CSB_COLS = (['CDL', 'geometry'] if 'CDL' in csb.columns else ['geometry'])
+    # The year columns ride through the overlay with CDL, so a surface
+    # built from here on carries the sequence natively and needs no join.
+    # CSBID comes too: it is a STABLE id, where _fid is positional, so a
+    # later join can key on it instead of on row order.
+    _CSB_COLS = ([c for c in (['CSBID', 'CDL'] + cdl_year_cols(csb))
+                  if c in csb.columns] + ['geometry'])
     if 'CDL' not in csb.columns:
         print('  NOTE: no CDL column on csb - crop identity is unavailable')
     _csb_all = csb[_CSB_COLS].copy()
@@ -872,6 +877,184 @@ if len(_sample_fips) and _want_surface:
             _f.write(f'STRtree cell allocation vs gpd.overlay, county '
                      f'{_sample_fips.iloc[0]}, {len(_sub)} cells: '
                      f'max per-cell difference {_d:.3e} ac\n')
+
+
+# ---- the crop sequence: N years of CSB, one label per field ---------------
+# WHAT WAS ASKED FOR. "Was this field fallow, grazed, row crop, hay or
+# pasture?" - and because one year cannot answer that, over the last
+# CROP_SEQ_YEARS years.
+#
+# WHY IT IS CHEAP. CSB polygons are drawn so the crop sequence is CONSTANT
+# within each one - the whole dataset exists for this. All eight years of the
+# 2018-2025 release ride on the SAME polygon as separate integer columns,
+# CDL2018 ... CDL2025, so this adds ATTRIBUTES, not geometry. No new corridor,
+# no new lattice, no new overlay, no new intersection. The cost is a groupby.
+#
+# TWO WAYS THE YEARS GET HERE, and the first one is free:
+#
+#   NATIVE  a Pass A built after the registry started asking for N years
+#           already carries them on rip_crop. Nothing to do but classify.
+#   JOINED  an older surface carries only `CDL`. rip_crop also carries `_fid`,
+#           the positional index into the cached csb layer, so the years can
+#           be joined on without rebuilding Pass A - seconds, not hours.
+#
+# THE JOIN IS VERIFIED, NOT ASSUMED. A positional id is valid only while the
+# cached layer's row order holds, and re-caching csb to add columns is exactly
+# the moment that could move. But rip_crop already carries `CDL`, which IS the
+# newest year - so joining the newest year back by _fid and comparing it with
+# the column already sitting there is a complete check, on every piece. If it
+# disagrees anywhere, the join is refused and the run says to rebuild Pass A
+# rather than reporting a sequence built from the wrong rows.
+#
+# WHAT CDL CANNOT TELL YOU, and this belongs in the briefing rather than a
+# footnote: 62 is 'Pasture/Grass' and 176 is 'Grass/Pasture', and both mean
+# "this looked like grass from orbit". GRAZING IS INFERRED FROM A GRASS CLASS,
+# NEVER OBSERVED. A pasture acreage here is not a stocking figure.
+#
+# CROP_SEQ_YEARS = 1 turns the whole block off, which is also the escape hatch
+# if a join ever refuses and you do not want to rebuild today.
+CROP_SEQ_YEARS = int(globals().get('CROP_SEQ_YEARS', 3))
+
+# ONE CDL -> FAMILY MAPPING FOR THE WHOLE RUN, built from the config table.
+# C5b's zone cover columns use this same object rather than rebuilding it, so
+# the per-year class and the per-piece cover class cannot drift apart.
+_CDL_FAMILY = {c: g for g, codes in CDL_GROUPS.items() for c in codes}
+_SEQ_GRASS = ('hay', 'pasture')
+
+# The vocabulary. Deliberately short, mutually exclusive and exhaustive - a
+# field lands in exactly one - and ordered here the way a legend should read.
+CROP_SEQ_CLASSES = ('continuous row crop', 'continuous hay',
+                    'continuous pasture', 'continuous grass',
+                    'row crop to grass', 'grass to row crop',
+                    'fallow in sequence', 'mixed / other', 'unknown')
+
+
+def seq_work_class(code):
+    """One CDL code -> the working class the ladder below reasons about.
+
+    Five classes, not nine: the sequence question is about crop vs grass vs
+    idle, and splitting grass into hay and pasture is kept because that is
+    the distinction the question was asked in. Everything the config does not
+    class as pasture, hay or fallow is a row crop, which is what CDL's long
+    tail of minor crops actually is."""
+    if code is None or pd.isna(code):
+        return None
+    fam = _CDL_FAMILY.get(int(code), 'row_crop')
+    if fam in ('hay', 'pasture', 'fallow'):
+        return fam
+    return 'crop' if fam == 'row_crop' else 'other'
+
+
+def crop_seq_class(work):
+    """A sequence of working classes, OLDEST FIRST -> one label.
+
+    A PRIORITY LADDER rather than a lookup, because the categories a reviewer
+    cares about genuinely overlap. crop -> fallow -> hay is both "has a fallow
+    year" and "went to grass", and the transition is the more actionable of
+    the two, so transitions are tested before fallow. Ties in that sense are
+    resolved here, once, rather than differently in every table."""
+    w = [x for x in work if x]
+    if not w:
+        return 'unknown'
+    s = set(w)
+    if len(s) == 1:                      # the same thing every year
+        return {'crop': 'continuous row crop', 'hay': 'continuous hay',
+                'pasture': 'continuous pasture',
+                'fallow': 'fallow in sequence'}.get(w[0], 'mixed / other')
+    if s <= set(_SEQ_GRASS):             # hay one year, pasture the next
+        return 'continuous grass'
+    if w[0] == 'crop' and w[-1] in _SEQ_GRASS:
+        return 'row crop to grass'
+    if w[0] in _SEQ_GRASS and w[-1] == 'crop':
+        return 'grass to row crop'
+    if 'fallow' in s:
+        return 'fallow in sequence'
+    return 'mixed / other'
+
+
+SEQ_COLS, SEQ_SOURCE = [], 'off'
+if CROP_SEQ_YEARS > 1:
+    rule('CROP SEQUENCE - WHAT THESE FIELDS HAVE BEEN')
+    _s_rip = cdl_year_cols(rip_crop)
+    _s_csb = cdl_year_cols(csb)
+
+    if len(_s_rip) >= 2:
+        SEQ_COLS, SEQ_SOURCE = _s_rip[-CROP_SEQ_YEARS:], 'native'
+        print(f'  rip_crop carries {len(_s_rip)} CDL year column(s) already - '
+              f'no join needed')
+    elif len(_s_csb) >= 2 and '_fid' in rip_crop.columns:
+        _want = _s_csb[-CROP_SEQ_YEARS:]
+        _fid = pd.to_numeric(rip_crop['_fid'], errors='coerce').to_numpy()
+        if np.isnan(_fid).any() or int(np.nanmax(_fid)) >= len(csb):
+            raise RuntimeError(
+                f'the crop sequence cannot be joined: rip_crop._fid reaches '
+                f'{int(np.nanmax(_fid))} but the cached csb layer has only '
+                f'{len(csb):,} rows.\n  The cache was rebuilt with a different '
+                f'row count since this surface was made. Set RUN_SURFACE = '
+                f'True\n  to rebuild Pass A, or CROP_SEQ_YEARS = 1 to skip the '
+                f'sequence.')
+        _fid = _fid.astype(int)
+        _join = {c: csb[c].to_numpy()[_fid] for c in _want}
+
+        # THE CHECK. `CDL` on rip_crop came from the newest year at the time
+        # the surface was built, so it is an independent copy of exactly what
+        # the join should reproduce.
+        _old = pd.to_numeric(pd.Series(rip_crop['CDL'].to_numpy()),
+                             errors='coerce').to_numpy()
+        _new = pd.to_numeric(pd.Series(_join[_want[-1]]),
+                             errors='coerce').to_numpy()
+        _both = ~pd.isna(_old) & ~pd.isna(_new)
+        _bad = int((_old[_both] != _new[_both]).sum())
+        print(f'  CHECK joined {_want[-1]} against the CDL already on '
+              f'rip_crop: {int(_both.sum()):,} comparable pieces, '
+              f'{_bad:,} disagree')
+        if _bad:
+            raise RuntimeError(
+                f'the crop-sequence join is NOT valid: {_bad:,} of '
+                f'{int(_both.sum()):,} pieces disagree.\n  rip_crop._fid is a '
+                f'POSITIONAL index into the cached csb layer, and that layer\'s '
+                f'row order\n  has moved since this surface was built. Set '
+                f'RUN_SURFACE = True to rebuild Pass A\n  (the years then ride '
+                f'through the overlay natively), or CROP_SEQ_YEARS = 1 to skip '
+                f'this.')
+        for _c in _want:
+            rip_crop[_c] = _join[_c]
+        SEQ_COLS, SEQ_SOURCE = _want, 'joined'
+        print(f'  joined {", ".join(_want)} onto {len(rip_crop):,} pieces by '
+              f'_fid, verified')
+    elif len(_s_csb) < 2:
+        print(f'  only {len(_s_csb)} CDL year column(s) in the cache, so there '
+              f'is no sequence to read.\n  The registry asks for '
+              f'{CROP_SEQ_YEARS} (CROP_SEQ_YEARS); re-run fl_01_preprocess.py '
+              f'and it will\n  notice the csb layer is short of columns and '
+              f'rebuild that one layer.')
+    else:
+        print('  rip_crop has no _fid column, so the years cannot be joined. '
+              'Set\n  RUN_SURFACE = True to rebuild Pass A with the years '
+              'carried natively.')
+
+if SEQ_COLS:
+    # Memoised on the TUPLE of working classes - there are at most a few dozen
+    # distinct sequences in a state, against hundreds of thousands of pieces.
+    _wcols = [pd.to_numeric(rip_crop[c], errors='coerce')
+              .map(seq_work_class).to_numpy() for c in SEQ_COLS]
+    _memo = {}
+    rip_crop['rip_seq_class'] = [
+        _memo[t] if t in _memo else _memo.setdefault(t, crop_seq_class(t))
+        for t in zip(*_wcols)]
+    _st = (rip_crop.groupby('rip_seq_class')['ac'].agg(['size', 'sum'])
+           .reindex(CROP_SEQ_CLASSES).dropna(how='all'))
+    _tot = float(max(_st['sum'].sum(), 1e-9))
+    print(f'\n  {" / ".join(SEQ_COLS)}  ({SEQ_SOURCE})')
+    print(f'  riparian cropland by what the field has been:')
+    for _k, _r in _st.iterrows():
+        print(f'    {_k:<22} {_r["sum"]:>10,.0f} ac  '
+              f'{100 * _r["sum"] / _tot:>5.1f}%   {int(_r["size"]):>8,} pieces')
+    print(f'  GRAZING IS INFERRED, NOT OBSERVED - CDL 62 and 176 both mean '
+          f'"grass from orbit".')
+else:
+    rip_crop['rip_seq_class'] = 'unknown'
+
 
 
 # %% B6 - the reporting mask: report inside the priority area, keep the surface
@@ -1852,7 +2035,9 @@ def water_stats(geoms, names=True):
 #
 # An unlisted code is a row crop. That is what CDL's long tail of minor crops
 # actually is, and it is the same default the config's grouping implies.
-_ZONE_CDL_GRP = {c: g for g, codes in CDL_GROUPS.items() for c in codes}
+# Built in the crop-sequence block above, from the same config table, so
+# the per-year working class and the per-piece cover family cannot drift.
+_ZONE_CDL_GRP = _CDL_FAMILY
 
 # A zone laps into the subwatershed next door as well as into the county next
 # door, and for the same reason - it is a union of whole 1-mile cells. Smaller
@@ -1875,7 +2060,7 @@ def cover_huc_stats(geoms, names=True):
     n = len(g)
     wide = pd.DataFrame(index=pd.RangeIndex(n))
     cdl_long = pd.DataFrame(columns=['row', 'CDL', 'cdl_name', 'grp',
-                                     'rip_crop_ac'])
+                                     'rip_seq_class', 'rip_crop_ac'])
     huc_long = pd.DataFrame(columns=['row', 'huc12', 'huc12_name',
                                      'ac_in_huc12', 'pct_of_zone'])
     if not n:
@@ -1889,6 +2074,7 @@ def cover_huc_stats(geoms, names=True):
     wide['rip_cdl_dominant'] = pd.NA
     wide['rip_cdl_dominant_name'] = ''
     wide['rip_cdl_acres'] = ''
+    wide['rip_seq_class'] = 'unknown'
 
     if 'CDL' in rip_crop.columns:
         rg = np.asarray(rip_crop.geometry.values, dtype=object)
@@ -1899,12 +2085,16 @@ def cover_huc_stats(geoms, names=True):
                 'row': _gi,
                 'CDL': pd.to_numeric(pd.Series(rip_crop['CDL'].to_numpy()[_ri]),
                                      errors='coerce'),
+                'rip_seq_class': (rip_crop['rip_seq_class'].to_numpy()[_ri]
+                                  if 'rip_seq_class' in rip_crop.columns
+                                  else 'unknown'),
                 'rip_crop_ac': _ia})
             _d = _d[_d['rip_crop_ac'] > 0]
         else:
             _d = pd.DataFrame(columns=['row', 'CDL', 'rip_crop_ac'])
         if len(_d):
-            cdl_long = (_d.groupby(['row', 'CDL'], dropna=False)['rip_crop_ac']
+            cdl_long = (_d.groupby(['row', 'CDL', 'rip_seq_class'],
+                                   dropna=False)['rip_crop_ac']
                         .sum().reset_index())
             cdl_long['CDL'] = cdl_long['CDL'].astype('Int64')
             cdl_long['cdl_name'] = [
@@ -1943,6 +2133,16 @@ def cover_huc_stats(geoms, names=True):
                 _lab.groupby(cdl_long['row'])
                 .apply(lambda s: ', '.join(s.head(ZONE_CDL_TOP)))
                 .reindex(range(n)).fillna('').to_numpy())
+            # ONE sequence column on the summary: the class holding the
+            # most riparian acres here. The full split stays in
+            # zone_cover_by_cdl.csv, which now carries the class per row.
+            _sq = (cdl_long.groupby(['row', 'rip_seq_class'])['rip_crop_ac']
+                   .sum().reset_index()
+                   .sort_values(['row', 'rip_crop_ac'],
+                                ascending=[True, False])
+                   .drop_duplicates('row').set_index('row'))
+            wide['rip_seq_class'] = (_sq['rip_seq_class'].reindex(range(n))
+                                     .fillna('unknown').to_numpy())
 
     # --- which subwatersheds it sits in -----------------------------------
     wide['n_huc12'] = 0
@@ -2017,7 +2217,8 @@ if len(zones):
     ZONE_HUC_CSV = os.path.join(S_OUT, 'zone_huc12.csv')
     if len(_cdl_long):
         (_cdl_long.rename(columns={'row': 'zone_id'})
-         [['zone_id', 'CDL', 'cdl_name', 'grp', 'rip_crop_ac']]
+         [['zone_id', 'CDL', 'cdl_name', 'grp', 'rip_seq_class',
+           'rip_crop_ac']]
          .round(2).to_csv(ZONE_CDL_CSV, index=False))
     if len(_huc_long):
         (_huc_long.rename(columns={'row': 'zone_id'})
@@ -2074,7 +2275,7 @@ if len(zones):
                  'pct_in_primary_huc12', 'huc12_ids']
               + [f'rip_{g}_ac' for g in GRP_ORDER]
               + ['rip_cover', 'rip_cdl_dominant', 'rip_cdl_dominant_name',
-                 'rip_n_cdl', 'rip_cdl_acres']
+                 'rip_n_cdl', 'rip_cdl_acres', 'rip_seq_class']
               + ['n_zones_within_band', 'nearest_zone_mi'])
     _ZCOLS = [c for c in _ZCOLS if c in zones.columns]
     zones.reset_index()[['zone_id'] + _ZCOLS].round(2).to_csv(ZONE_CSV,
@@ -3524,7 +3725,9 @@ def pass_c(fips, name, county_id, row):
     # ONE overlay, with the source flags carried through, so the per-source
     # acres come out of the same intersection rather than four more.
     _ON = [f'on_{n}' for n in USE_SOURCES if f'on_{n}' in rip_crop.columns]
-    _cols = _ON + (['CDL'] if 'CDL' in rip_crop.columns else []) + ['geometry']
+    _cols = (_ON + (['CDL'] if 'CDL' in rip_crop.columns else [])
+             + (['rip_seq_class'] if 'rip_seq_class' in rip_crop.columns
+                else []) + ['geometry'])
     _rc = rip_crop.cx[bx[0]:bx[2], bx[1]:bx[3]][_cols]
     pc = gpd.overlay(cl[[KEY, 'geometry']], _rc, how='intersection',
                      keep_geom_type=True)
@@ -3602,7 +3805,9 @@ def pass_c(fips, name, county_id, row):
         _cd['CDL'] = pd.to_numeric(_cd['CDL'], errors='coerce').astype('Int64')
         _cd['grp'] = [_CDL_GRP.get(int(c), 'row_crop') if pd.notna(c)
                       else 'unknown' for c in _cd['CDL']]
-        percdl = (_cd.groupby([KEY, 'CDL'], observed=True)['ac'].sum()
+        _pk = ([KEY, 'CDL', 'rip_seq_class']
+               if 'rip_seq_class' in _cd.columns else [KEY, 'CDL'])
+        percdl = (_cd.groupby(_pk, observed=True)['ac'].sum()
                   .round(3).reset_index().rename(columns={'ac': 'buffer_ac'}))
         percdl['cdl_name'] = percdl['CDL'].map(
             lambda c: CDL_NAMES.get(int(c), f'CDL {c}') if pd.notna(c)
@@ -3635,6 +3840,15 @@ def pass_c(fips, name, county_id, row):
         _dom = percdl.drop_duplicates(KEY).set_index(KEY)
         cl['rip_cdl_dominant'] = cl[KEY].map(_dom['CDL'])
         cl['rip_cdl_dominant_name'] = cl[KEY].map(_dom['cdl_name'])
+        # what this parcel's riparian ground HAS BEEN, by acreage - one
+        # column, the same vocabulary the zone table uses
+        if 'rip_seq_class' in percdl.columns:
+            _ps = (percdl.groupby([KEY, 'rip_seq_class'])['buffer_ac']
+                   .sum().reset_index()
+                   .sort_values([KEY, 'buffer_ac'], ascending=[True, False])
+                   .drop_duplicates(KEY).set_index(KEY))
+            cl['rip_seq_class'] = (cl[KEY].map(_ps['rip_seq_class'])
+                                   .fillna('unknown'))
         _nc = sum(cl[f'rip_{g}_ac'].sum() for g in GRP_ORDER
                   if g != 'row_crop')
         print(f'    buffer cover   row crop '
@@ -3772,7 +3986,8 @@ def pass_c(fips, name, county_id, row):
                              'score': cand['score'].values})
     for _k, _src in _found.items():
         contacts[_k] = cand[_src].values
-    for _c in ['huc12', 'huc12_name', 'zone_id', 'in_hotspot', 'cell',
+    for _c in ['rip_seq_class',
+               'huc12', 'huc12_name', 'zone_id', 'in_hotspot', 'cell',
                'cell_is_hot', 'cell_p_state', 'nbhd_rip_per_sqmi',
                'nbhd_ratio', 'nbhd_vs_county', 'cell_reference',
                'rip_crop_ac', 'rip_crop_per_ac', 'rip_crop_frac', 'parcel_ac',
@@ -4954,3 +5169,4 @@ print(f'    {C_DIR}/<FIPS>_<Name>/output|figures|validation/')
 # six-hour run is the weakest link in any pipeline. Does nothing when
 # SCRATCH_DIR is None, which is the normal local case.
 copy_to_final()
+

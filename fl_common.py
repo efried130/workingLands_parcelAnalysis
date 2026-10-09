@@ -301,8 +301,25 @@ def resolve_cols(available, wanted):
     return [lut[w.lower()] for w in wanted if w.lower() in lut]
 
 
+def newest_spec(spec):
+    """Decode a registry row's `newest` into (alias, pattern, n_years).
+
+    ('CDL', pattern)      -> keep the newest year only
+    ('CDL', pattern, 3)   -> keep the newest three
+
+    THE ONLY PLACE THAT DECODES THIS TUPLE. It grew a third element for
+    the crop sequence and normalise() was still unpacking two, which
+    raised on the first cached csb load and stopped the whole run. Four
+    callers indexing a tuple by hand is how that happens; one accessor
+    is how it stops. Returns None when the row has no `newest`."""
+    n = (spec or {}).get('newest')
+    if not n:
+        return None
+    return (n[0], n[1], int(n[2]) if len(n) > 2 else 1)
+
+
 def normalise(g, name, verbose=True):
-    """Rename the newest year-stamped column to its stable name (CDL2025 -> CDL).
+    """Give the newest year-stamped column its stable alias (CDL2025 -> CDL).
 
     THIS RUNS ON THE CACHE PATH TOO, and that is the whole point. A cache
     written before the rename existed holds the RAW column name. Load it
@@ -310,22 +327,42 @@ def normalise(g, name, verbose=True):
     fail, it silently skips every crop table and map. A normalisation that runs
     on only one of two load paths is a trap."""
     spec = DATASETS.get(name)
-    if g is None or spec is None or not spec.get('newest'):
+    _ns = newest_spec(spec)
+    if g is None or _ns is None:
         return g
-    want, pat = spec['newest']
+    want, pat = _ns[0], _ns[1]
     if want in g.columns:
         return g
-    hits = sorted(c for c in g.columns if re.fullmatch(pat, c, re.I))
+    hits = cdl_year_cols(g, pat)
     if hits:
         if verbose:
             print(f'  {name:<12} using {hits[-1]!r} as {want!r}'
                   + (f' (also present: {", ".join(hits[:-1])})'
                      if len(hits) > 1 else ''))
-        return g.rename(columns={hits[-1]: want})
+        # A COPY, NOT A RENAME. The crop sequence needs the years under
+        # their own names, and `CDL` is an alias for the newest one that
+        # everything written before the sequence existed still reads.
+        # Renaming gave the newest year away to get the alias.
+        g = g.copy()
+        g[want] = g[hits[-1]]
+        return g
     if verbose:
         print(f'  {name:<12} NO {want} COLUMN and nothing matching {pat!r}. '
               f'Crop tables will be skipped.')
     return g
+
+
+def cdl_year_cols(frame, pat=r'CDL\d{4}'):
+    """Year-stamped CDL columns on a frame, OLDEST FIRST.
+
+    One place that knows the naming, so the preprocessing read, Pass A's
+    carry-through and the sequence classifier cannot disagree about which
+    columns are years. Sorted, so [-1] is always the newest and
+    [-N:] is always the newest N."""
+    if frame is None:
+        return []
+    return sorted(c for c in frame.columns
+                  if re.fullmatch(pat, str(c), re.I))
 
 
 def cache_layers(path=None):
@@ -361,6 +398,20 @@ def gpkg_safe(gdf):
 # unreadable every layer is treated as stale, which is the safe direction.
 CACHE_MANIFEST = os.path.splitext(CACHE)[0] + '.cache.json'
 
+# A SIDECAR THAT HAS TO TRAVEL WITH THE CACHE. The GeoPackage moves
+# between scratch and the project folder, so the manifest has to be
+# findable from either side. It is not: a cache restored from the
+# project folder without its sidecar has no record of what built it,
+# every layer reads as stale, and a run that should have rebuilt one
+# layer rebuilds all nine. Two halves to the fix - the end of fl_01
+# copies the sidecar with the GeoPackage, and a READ falls back to the
+# sidecar beside the other candidate cache location, which covers a
+# GeoPackage someone copied by hand on its own.
+CACHE_MANIFEST_CANDIDATES = [
+    os.path.splitext(os.path.join(_d, CACHE_NAME))[0] + '.cache.json'
+    for _d in (CLIPPED_DIR, FINAL_CLIPPED_DIR)]
+_MANIFEST_SAID = set()
+
 
 def source_fingerprint(path):
     """What a source file looked like when we read it.
@@ -387,12 +438,33 @@ def source_fingerprint(path):
     return {'path': path, 'mtime': round(st.st_mtime, 3), 'size': st.st_size}
 
 
-def read_cache_manifest():
-    try:
-        with open(CACHE_MANIFEST) as f:
-            return json.load(f)
-    except Exception:
-        return {}
+def read_cache_manifest(verbose=True):
+    """Provenance for the cached layers: the sidecar beside the cache in
+    use, or failing that the one beside the other candidate copy.
+
+    THE FALLBACK IS NOT A CONVENIENCE. Without it, reading the cache
+    from a different folder than the one it was written in silently
+    discards every layer's provenance and rebuilds the lot. Says so
+    once when it falls back, because reading a record that sits next to
+    a DIFFERENT copy of the cache is worth one line of output."""
+    _seen = []
+    for _p in [CACHE_MANIFEST] + list(CACHE_MANIFEST_CANDIDATES):
+        if _p in _seen:
+            continue
+        _seen.append(_p)
+        try:
+            with open(_p) as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        if not d:
+            continue
+        if _p != CACHE_MANIFEST and verbose and _p not in _MANIFEST_SAID:
+            _MANIFEST_SAID.add(_p)
+            print('  manifest     no record beside the cache in use - '
+                  'reading ' + _p)
+        return d
+    return {}
 
 
 def write_cache_manifest(d):
@@ -402,19 +474,43 @@ def write_cache_manifest(d):
     os.replace(tmp, CACHE_MANIFEST)      # atomic: never a half-written manifest
 
 
-def layer_is_stale(name, spec, manifest=None):
-    """True when the cached layer was built from a file that has since changed,
-    or when we have no record of what it was built from."""
+def stale_reason(name, spec, manifest=None):
+    """Why this cached layer should be rebuilt, or None to keep it.
+
+    TWO DIFFERENT FACTS THAT USED TO PRINT THE SAME SENTENCE. A source
+    file that really changed and a cache with no record of what built it
+    both mean "rebuild", but only the first is news about raw_data/. The
+    second happens every time a cache is restored without its sidecar,
+    and calling that a changed source sends you looking for a download
+    that never happened. Returns the reason so the caller can print it,
+    and names the size change when there is one - a re-download that
+    arrives at a different size is worth seeing, and one that arrives at
+    the same size but a new mtime is worth distinguishing from it."""
     man = read_cache_manifest() if manifest is None else manifest
     was = man.get(name, {}).get('source')
     now = source_fingerprint(spec.get('path'))
     if now is None:                      # source gone: keep what we have
-        return False
+        return None
     if not was:
-        return True                      # no record = rebuild, the safe way
-    return (was.get('mtime') != now.get('mtime')
-            or was.get('size') != now.get('size')
-            or was.get('path') != now.get('path'))
+        return 'no record of what this layer was built from'
+    if was.get('path') != now.get('path'):
+        _old = os.path.basename(str(was.get('path')))
+        return f'now built from a different file (was {_old})'
+    if was.get('size') != now.get('size'):
+        _a, _b = was.get('size') or 0, now.get('size') or 0
+        _f = ((lambda n: f'{n / 1e6:,.1f} MB') if max(_a, _b) >= 1e6
+              else (lambda n: f'{n:,} bytes'))
+        return f'the source file changed size ({_f(_a)} -> {_f(_b)})'
+    if was.get('mtime') != now.get('mtime'):
+        return 'the source file was modified (same size, new timestamp)'
+    return None
+
+
+def layer_is_stale(name, spec, manifest=None):
+    """True when the cached layer should be rebuilt. stale_reason() is
+    the same question with the answer attached; this stays for callers
+    that only need the boolean."""
+    return stale_reason(name, spec, manifest) is not None
 
 
 # %% M3c - county names, for any state
@@ -598,13 +694,22 @@ def read_source(name, bbox=None, verbose=True):
             if spec.get('wanted') else None)
     newest_src = None
     if spec.get('newest'):
-        _as, _pat = spec['newest']
+        # ('CDL', pattern) keeps one year; a third element keeps that many
+        # of the NEWEST years, which is what the crop sequence reads. The
+        # years are read under their own names and `CDL` is added as an
+        # alias for the newest, so nothing that predates the sequence
+        # notices the difference.
+        _as, _pat, _keep_n = newest_spec(spec)
         hits = sorted(f for f in info['fields'] if re.fullmatch(_pat, f, re.I))
         if hits:
-            newest_src = hits[-1]
-            cols = (cols or []) + [newest_src]
+            _take = hits[-max(_keep_n, 1):]
+            newest_src = _take[-1]
+            cols = (cols or []) + _take
             if verbose:
-                print(f'  {name:<12} newest {_as} field: {newest_src}')
+                print(f'  {name:<12} newest {_as} field: {newest_src}'
+                      + (f'  (+{len(_take) - 1} earlier year(s): '
+                         f'{", ".join(_take[:-1])})'
+                         if len(_take) > 1 else ''))
         elif verbose:
             print(f'  {name:<12} no field matching {_pat!r} - {_as} omitted')
 
@@ -632,7 +737,7 @@ def read_source(name, bbox=None, verbose=True):
     if str(g.crs) != WORKING_CRS:
         g = g.to_crs(WORKING_CRS)
     if newest_src:
-        g = g.rename(columns={newest_src: spec['newest'][0]})
+        g[newest_spec(spec)[0]] = g[newest_src]   # alias, not a rename
     if spec.get('wanted'):
         lost = [c for c in spec['wanted']
                 if c.lower() not in {x.lower() for x in g.columns}]

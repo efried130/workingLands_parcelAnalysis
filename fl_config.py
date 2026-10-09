@@ -385,6 +385,26 @@ MIN_SOURCE_COVER = 0.95
 # `BASIS = 'county'` with `FLOOR_MODE = 'off'` reproduces the single-county
 # notebook's rule exactly. That is how the two are kept comparable.
 
+# HOW MANY YEARS OF CSB TO READ, for the crop-sequence label.
+#
+# CSB polygons are drawn so the crop sequence is CONSTANT within each one,
+# and every year of the release rides on the SAME polygon as its own
+# integer column (CDL2018 ... CDL2025 in the 2018-2025 release). So this
+# costs columns, not geometry: no extra corridor, lattice or overlay, and
+# the run-time cost is a groupby.
+#
+# 3 answers "what has this field been lately" - the question a field rep
+# asks - without reaching back to land use that has since changed. Raise it
+# for a longer rotation history; 1 turns the sequence off entirely and
+# restores the single-year behaviour.
+#
+# Changing this makes the cached csb layer short of columns, which
+# fl_01_preprocess.py notices on its own and fixes by rebuilding that ONE
+# layer. It does NOT require a Pass A rebuild: an existing surface gets the
+# years joined on by _fid and verified against the CDL column it already
+# carries (see the crop-sequence block below B5b).
+CROP_SEQ_YEARS = 3
+
 # %% C4 - the rule
 CELL_MI        = 1.0     # grid cell
 BAND_MI        = 3.0     # neighbourhood radius - a field rep's working range
@@ -788,7 +808,7 @@ DATASETS = {
         pattern=['CSB*.gdb', '*CSB*.gdb', 'CSB*.gpkg'],
         layer='national1825',
         wanted=['CSBID', 'CSBACRES', 'STATEFIPS', 'CNTY', 'CNTYFIPS'],
-        newest=('CDL', r'CDL\d{4}'),
+        newest=('CDL', r'CDL\d{4}', CROP_SEQ_YEARS),
         where=f"STATEFIPS = '{STATE_FIPS}'",
         stage='layer', required=True,
         degrades='nothing runs - this is the cropland'),
